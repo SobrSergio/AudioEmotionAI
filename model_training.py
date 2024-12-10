@@ -1,3 +1,15 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization, Input, Add
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import librosa
+from sklearn.utils.class_weight import compute_class_weight
+
 # Определение классов эмоций
 EMOTIONS = {
     0: 'neutral',
@@ -10,49 +22,43 @@ EMOTIONS = {
     7: 'surprised'
 }
 
-# Импортируем необходимые библиотеки
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.preprocessing import StandardScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping
-import librosa
+# Аугментация данных
 
-# Аугментация данных (пример: добавление шума, изменение скорости, изменение высоты тона)
-def augment_data(features):
-    augmented = []
-    for feature in features:
+def augment_data(features, labels):
+    augmented_features, augmented_labels = [], []
+    for feature, label in zip(features, labels):
+        augmented_features.append(feature)
+        augmented_labels.append(label)
+
         # Добавление шума
         noise = np.random.normal(0, 0.05, feature.shape)
-        noisy_feature = feature + noise
-        augmented.append(noisy_feature)
+        augmented_features.append(feature + noise)
+        augmented_labels.append(label)
 
         # Изменение скорости
         try:
-            stretched_feature = librosa.effects.time_stretch(feature, rate=1.1)
-            if len(stretched_feature) > len(feature):
-                stretched_feature = stretched_feature[:len(feature)]
-            else:
-                stretched_feature = np.pad(stretched_feature, (0, len(feature) - len(stretched_feature)), mode='constant')
-            augmented.append(stretched_feature)
-        except Exception as e:
-            print(f"Ошибка при изменении скорости: {e}")
+            stretched = librosa.effects.time_stretch(feature, rate=1.2)
+            padded = np.pad(stretched, (0, max(0, len(feature) - len(stretched))), mode='constant')
+            augmented_features.append(padded[:len(feature)])
+            augmented_labels.append(label)
+        except Exception:
+            pass
 
         # Изменение высоты тона
         try:
-            pitched_feature = librosa.effects.pitch_shift(feature, sr=48000, n_steps=2)
-            if len(pitched_feature) > len(feature):
-                pitched_feature = pitched_feature[:len(feature)]
-            else:
-                pitched_feature = np.pad(pitched_feature, (0, len(feature) - len(pitched_feature)), mode='constant')
-            augmented.append(pitched_feature)
-        except Exception as e:
-            print(f"Ошибка при изменении высоты тона: {e}")
-    return np.array(augmented)
+            pitched = librosa.effects.pitch_shift(feature, sr=48000, n_steps=np.random.uniform(-3, 3))
+            padded = np.pad(pitched, (0, max(0, len(feature) - len(pitched))), mode='constant')
+            augmented_features.append(padded[:len(feature)])
+            augmented_labels.append(label)
+        except Exception:
+            pass
+
+        # Увеличение для нейтральной эмоции
+        if label == 0:
+            augmented_features.extend([feature + np.random.normal(0, 0.1, feature.shape) for _ in range(3)])
+            augmented_labels.extend([label] * 3)
+
+    return np.array(augmented_features), np.array(augmented_labels)
 
 # Загрузка данных
 X_train = np.load('processed_data/train_features.npy')
@@ -62,50 +68,81 @@ y_val = np.load('processed_data/val_labels.npy')
 X_test = np.load('processed_data/test_features.npy')
 y_test = np.load('processed_data/test_labels.npy')
 
-# Проверка и масштабирование данных
+# Масштабирование данных
 scaler = StandardScaler()
 X_train = scaler.fit_transform(X_train)
 X_val = scaler.transform(X_val)
 X_test = scaler.transform(X_test)
 
 # Аугментация данных
-X_train_augmented = augment_data(X_train)
-y_train_augmented = np.repeat(y_train, 3)  # Повторяем метки для увеличенных данных
-
-# Обновляем тренировочный набор
+X_train_augmented, y_train_augmented = augment_data(X_train, y_train)
 X_train = np.vstack([X_train, X_train_augmented])
 y_train = np.hstack([y_train, y_train_augmented])
 
-# Строим модель
-model = Sequential([
-    Dense(512, input_shape=(X_train.shape[1],), activation='relu'),
-    Dropout(0.5),
-    Dense(256, activation='relu'),
-    Dropout(0.3),
-    Dense(128, activation='relu'),
-    Dense(8, activation='softmax')  # 8 классов эмоций
-])
+# Вычисление весов классов
+class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+class_weights = {i: weight for i, weight in enumerate(class_weights)}
 
-model.compile(optimizer=Adam(learning_rate=0.0005),
-              loss='sparse_categorical_crossentropy',
-              metrics=['accuracy'])
+# Residual Block
 
-# EarlyStopping с увеличением терпения
-early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+def residual_block(x, units):
+    shortcut = x
+    x = Dense(units, activation='relu', kernel_regularizer='l2')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.3)(x)
+    x = Dense(units, activation='relu', kernel_regularizer='l2')(x)
+
+    # Выравнивание размеров, если они различаются
+    if shortcut.shape[-1] != units:
+        shortcut = Dense(units, kernel_regularizer='l2')(shortcut)
+
+    x = Add()([x, shortcut])
+    x = BatchNormalization()(x)
+    return x
+
+# Создание модели с Residual Connections
+
+def build_model(input_shape):
+    inputs = Input(shape=(input_shape,))
+    x = Dense(1024, activation='relu', kernel_regularizer='l2')(inputs)
+    x = BatchNormalization()(x)
+    x = Dropout(0.5)(x)
+
+    x = residual_block(x, 512)
+    x = residual_block(x, 256)
+
+    x = Dense(128, activation='relu', kernel_regularizer='l2')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.3)(x)
+
+    outputs = Dense(8, activation='softmax')(x)
+    model = Model(inputs, outputs)
+
+    model.compile(optimizer=Adam(learning_rate=0.0001),
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'])
+    return model
 
 # Обучение модели
+model = build_model(X_train.shape[1])
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+
 history = model.fit(
     X_train, y_train,
-    epochs=100,
-    batch_size=64,
+    epochs=200,
+    batch_size=128,
     validation_data=(X_val, y_val),
-    callbacks=[early_stopping]
+    callbacks=[early_stopping, reduce_lr],
+    class_weight=class_weights
 )
 
 # Оценка модели
 y_pred = np.argmax(model.predict(X_test), axis=-1)
 accuracy = accuracy_score(y_test, y_pred)
+f1 = f1_score(y_test, y_pred, average='weighted')
 print(f"Точность модели на тестовых данных: {accuracy:.4f}")
+print(f"F1-метрика: {f1:.4f}")
 print("Полный отчет классификации:")
 print(classification_report(y_test, y_pred, target_names=EMOTIONS.values()))
 
